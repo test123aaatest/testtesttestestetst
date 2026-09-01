@@ -58,14 +58,15 @@
 set -u
 set -o pipefail
 
+# bash 4+ 关联数组（declare -A）检查
+(( BASH_VERSINFO[0] >= 4 )) || { echo "错误：需要 bash 4+（当前 ${BASH_VERSION}）。"; exit 1; }
+
 BASE_DIR="$(pwd)"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 RESULT_FORMAT="csv"
 AUTO=false
 LIST_ONLY=false
-ORIGINAL_CRYPTO_POLICY=""
-CRYPTO_POLICY_CHANGED=false
 CRYPTO_POLICY_TOOL=""
 CRYPTO_POLICY_MODE="${CRYPTO_POLICY_MODE:-capability}"
 
@@ -154,50 +155,13 @@ detect_crypto_policy_tool() {
     fi
 }
 
-crypto_policy_show() {
-    detect_crypto_policy_tool
-    [[ -n "$CRYPTO_POLICY_TOOL" ]] || return 1
-    "$CRYPTO_POLICY_TOOL" --show 2>/dev/null
-}
-
-crypto_policy_save() {
-    ORIGINAL_CRYPTO_POLICY=""
-    CRYPTO_POLICY_CHANGED=false
-    detect_crypto_policy_tool
-
-    if [[ -z "$CRYPTO_POLICY_TOOL" ]]; then
-        return 0
-    fi
-
-    ORIGINAL_CRYPTO_POLICY="$("$CRYPTO_POLICY_TOOL" --show 2>/dev/null || true)"
-    [[ -n "$ORIGINAL_CRYPTO_POLICY" ]] || return 0
-}
-
-crypto_policy_restore() {
-    if [[ "$CRYPTO_POLICY_CHANGED" != true ]]; then
-        return 0
-    fi
-    [[ -n "$CRYPTO_POLICY_TOOL" ]] || return 0
-    [[ -n "$ORIGINAL_CRYPTO_POLICY" ]] || return 0
-
-    log "Restoring crypto policy: $ORIGINAL_CRYPTO_POLICY"
-    "$CRYPTO_POLICY_TOOL" --set "$ORIGINAL_CRYPTO_POLICY" >/dev/null 2>&1 || \
-        warn "Failed to restore crypto policy: $ORIGINAL_CRYPTO_POLICY"
-    CRYPTO_POLICY_CHANGED=false
-}
-
-crypto_policy_restore_exit() {
-    crypto_policy_restore
-}
-trap crypto_policy_restore_exit EXIT INT TERM
-
 crypto_policy_requires_relaxation() {
     # --list must never mutate host state.
     [[ "$LIST_ONLY" != true ]] || return 1
     # Only capability mode may change system crypto policy.
     [[ "$CRYPTO_POLICY_MODE" == "capability" ]] || return 1
     [[ -n "$CRYPTO_POLICY_TOOL" ]] || return 1
-    [[ -n "$ORIGINAL_CRYPTO_POLICY" ]] || return 1
+    [[ -n "$INITIAL_CRYPTO_POLICY" ]] || return 1
 
     # LEGACY is a RHEL-family mechanism. Do not assume it on
     # arbitrary distributions even when a similarly named command exists.
@@ -215,13 +179,13 @@ crypto_policy_relax_for_test() {
     crypto_policy_requires_relaxation || return 0
 
     # Already permissive enough; do not change it.
-    case "$ORIGINAL_CRYPTO_POLICY" in
+    case "$INITIAL_CRYPTO_POLICY" in
         LEGACY|LEGACY:*)
             return 0
             ;;
     esac
 
-    log "Temporarily switching crypto policy from '$ORIGINAL_CRYPTO_POLICY' to 'LEGACY' for capability test"
+    log "Temporarily switching crypto policy from '$INITIAL_CRYPTO_POLICY' to 'LEGACY' for capability test"
     if "$CRYPTO_POLICY_TOOL" --set LEGACY >/dev/null 2>&1; then
         CRYPTO_POLICY_CHANGED=true
         return 0
@@ -252,8 +216,19 @@ for arg in "$@"; do
             PORT="${arg#--port=}"
             ;;
         -h|--help)
-            cat <<EOF
+            cat <<'EOF'
+用法: sudo ./test_ssh_algorithms_all.sh [选项]
 
+选项:
+  (无参数)           手动模式（默认，每项测试需手动触发/确认）
+  --auto             自动模式（本地回环客户端自动触发）
+  --list             只列出当前环境的测试项，不改动系统
+  --only=N           只运行编号为 N 的测试项（可与 --auto 组合）
+  --only=keyword     只运行描述包含 keyword 的测试项
+  --json             结果文件改为 JSON 格式
+  --csv              结果文件改为 CSV 格式（默认）
+  --port=N           指定测试端口（默认 22）
+  -h, --help         显示此帮助信息
 EOF
             exit 0
             ;;
@@ -273,11 +248,15 @@ need_cmd() {
 }
 
 log() {
-    printf '%s\n' "$*" | tee -a "$LOG_FILE"
+    if [[ -f "$LOG_FILE" ]]; then
+        printf '%s\n' "$*" | tee -a "$LOG_FILE"
+    else
+        printf '%s\n' "$*"
+    fi
 }
 
 env_log() {
-    printf '%s\n' "$*" >> "$ENV_FILE"
+    [[ -f "$ENV_FILE" ]] && printf '%s\n' "$*" >> "$ENV_FILE"
 }
 
 csv_escape() {
@@ -299,12 +278,18 @@ json_escape() {
     s=${s//$'\t'/\\t}
     s=${s//$'\b'/\\b}
     s=${s//$'\f'/\\f}
+    # 移除其它不可打印控制字符（0x00-0x1F 除已处理的），避免生成非法 JSON
+    s="$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')"
     printf '%s' "$s"
 }
 
 die() {
     log "[错误] $*"
     exit 1
+}
+
+warn() {
+    log "[警告] $*"
 }
 
 detect_env() {
@@ -339,7 +324,7 @@ detect_env() {
         SSH_VER_MINOR=""
     fi
     if SSHD_BIN="$(command -v sshd 2>/dev/null)" && [[ -n "$SSHD_BIN" ]]; then
-        SSHD_VER="$("$SSHD_BIN" -V 2>&1 | head -1 || true)"
+        SSHD_VER="$("$SSHD_BIN" -V 2>&1 || true)"
         if [[ "$SSHD_VER" =~ OpenSSH_([0-9]+)(\.([0-9]+))? ]]; then
             SSHD_VER_MAJOR="${BASH_REMATCH[1]}"
             SSHD_VER_MINOR="${BASH_REMATCH[3]:-0}"
@@ -351,14 +336,22 @@ detect_env() {
         SSHD_VER_MINOR=""
     fi
 
+    # sshd -V 在 OpenSSH < 7.2 上不支持（如 CentOS 6 / OpenSSH 5.3），
+    # 会导致 SSHD_VER_MAJOR 为空。此时回退到 ssh 客户端版本号——
+    # 同一系统上客户端和服务端版本通常一致。
+    if [[ -z "$SSHD_VER_MAJOR" ]] && [[ -n "$SSH_VER_MAJOR" ]]; then
+        SSHD_VER_MAJOR="$SSH_VER_MAJOR"
+        SSHD_VER_MINOR="${SSH_VER_MINOR:-0}"
+        env_log "sshd -V 不可用（OpenSSH < 7.2），回退到客户端版本: ${SSH_VER}"
+    fi
+
     # 判定 init 系统的关键：systemctl 命令存在并不代表 systemd 真正可用。
-    # 容器/某些环境（如 AlmaLinux/openEuler 容器）PID1 不是 systemd，
-    # systemctl 能列出 unit 却无法操作服务，重启会报
-    #   "System has not been booted with systemd as init system (PID 1)"
-    # 从而让每次 sshd 重启都失败。因此必须先用 is-system-running 验证
-    # systemd 真正在跑，失败则回退到 SysV service 命令。
+
     if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-system-running >/dev/null 2>&1; then
+        # is-system-running 在 degraded 状态返回 1，但 systemd 仍在正常运行。
+        # 用 /run/systemd/system 目录或 PID1 是否为 systemd 来判定，而非
+        # 依赖 is-system-running 的退出码（容器中 PID1 不是 systemd）。
+        if [[ -d /run/systemd/system ]] || [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]]; then
             local unit_list
             unit_list="$(systemctl list-unit-files 2>/dev/null || true)"
             if printf '%s\n' "$unit_list" | grep -q '^sshd\.service'; then
@@ -374,7 +367,17 @@ detect_env() {
     fi
     if [[ "$INIT" == "unknown" ]] && command -v service >/dev/null 2>&1; then
         INIT="sysv/service"
-        SERVICE="sshd"
+        if service --status-all 2>&1 | grep -qiE '^[[:space:]]*\?[[:space:]]+sshd'; then
+            SERVICE="sshd"
+        elif service --status-all 2>&1 | grep -qiE '^[[:space:]]*\?[[:space:]]+ssh$'; then
+            SERVICE="ssh"
+        elif [[ -x /etc/init.d/sshd ]]; then
+            SERVICE="sshd"
+        elif [[ -x /etc/init.d/ssh ]]; then
+            SERVICE="ssh"
+        else
+            SERVICE="sshd"
+        fi
     fi
 
     # ---- 画像判定：以 sshd 主版本号 + init 系统为准，不依赖客户端版本。
@@ -527,9 +530,9 @@ release_algorithm_supported() {
 }
 
 server_candidate_supported() {
-    # 无副作用地验证“当前 sshd 是否能接受该算法组合”。不修改系统配置，
+    # 无副作用地验证"当前 sshd 是否能接受该算法组合"。不修改系统配置，
     # 不重启服务；真正测试阶段仍会再次执行 -t/-T。
-    local type="$1" kex="$2" cipher="$3" mac="$4" hostkey="$5" proto="${6:-2}"
+    local kex="$1" cipher="$2" mac="$3" hostkey="$4" proto="${5:-2}"
     local tmp out hostkey_file
     [[ -n "$SSHD_BIN" && -f "$SSHD_CONFIG" ]] || return 2
     [[ "$proto" == "2" ]] || return 0
@@ -537,6 +540,7 @@ server_candidate_supported() {
     case "$hostkey" in
         ssh-dss|ssh-dss-cert-v01@openssh.com) hostkey_file="/etc/ssh/ssh_host_dsa_key" ;;
         ssh-ed25519|ssh-ed25519-cert-v01@openssh.com) hostkey_file="/etc/ssh/ssh_host_ed25519_key" ;;
+        ssh-ed448) hostkey_file="/etc/ssh/ssh_host_ed448_key" ;;
         ecdsa-sha2-nistp256|ecdsa-sha2-nistp256-cert-v01@openssh.com|ecdsa-sha2-nistp384|ecdsa-sha2-nistp384-cert-v01@openssh.com|ecdsa-sha2-nistp521|ecdsa-sha2-nistp521-cert-v01@openssh.com) hostkey_file="/etc/ssh/ssh_host_ecdsa_key" ;;
         ssh-sm2|sm2|sm2-cert-v01@openssh.com) hostkey_file="/etc/ssh/ssh_host_sm2_key" ;;
         *) hostkey_file="/etc/ssh/ssh_host_rsa_key" ;;
@@ -580,6 +584,7 @@ server_candidate_supported() {
         ssh-rsa|rsa-sha2-256|rsa-sha2-512) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_rsa_key$' ;;
         ssh-dss) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_dsa_key$' ;;
         ssh-ed25519) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ed25519_key$' ;;
+        ssh-ed448) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ed448_key$' ;;
         ecdsa-sha2-*) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ecdsa_key$' ;;
         ssh-sm2|sm2) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_sm2_key$' ;;
         *) return 1 ;;
@@ -587,6 +592,14 @@ server_candidate_supported() {
 }
 
 add_test() {
+    # 全局去重：同一 (kex, cipher, mac, hostkey, proto) 只保留首次出现。
+    # 统一在 add_test 内部去重，所有 loader 无需各自维护去重集合。
+    local _dedup_key="${2}|${3}|${4}|${5}|${7}|${8:-}"
+    if [[ -n "${GLOBAL_SEEN[$_dedup_key]:-}" ]]; then
+        FILTERED_TESTS=$((FILTERED_TESTS + 1))
+        return 0
+    fi
+
     # 第 ① 层：Worker（客户端）能力过滤，始终生效。
     if [[ "$7" == 1 ]]; then
         worker_algorithm_supported ssh1cipher "$3" || {
@@ -606,7 +619,7 @@ add_test() {
     # 被接受（无副作用，不重启不安装）。返回：0=可接受 1=明确不接受
     # 2=无法探测（复用发行版/版本黑名单作兜底，避免硬编码误杀厂商 backport）。
     if [[ "$7" == 2 ]]; then
-        server_candidate_supported combo "$2" "$3" "$4" "$5" 2
+        server_candidate_supported "$2" "$3" "$4" "$5" 2
         local src=$?
         if (( src == 1 )); then
             FILTERED_TESTS=$((FILTERED_TESTS + 1))
@@ -651,6 +664,10 @@ add_test() {
         fi
     fi
 
+    # 所有过滤检查通过后才标记 GLOBAL_SEEN，避免被过滤的组合
+    # 占据去重 key 导致后续同一组合被误判为"重复"而非"能力不足"。
+    GLOBAL_SEEN["$_dedup_key"]=1
+
     DESCS+=("$1")
     KEXES+=("$2")
     CIPHERS+=("$3")
@@ -690,6 +707,7 @@ server_algo_supported() {
                     ssh-sm2|sm2) hostkey_file="/etc/ssh/ssh_host_sm2_key" ;;
                     ssh-dss) hostkey_file="/etc/ssh/ssh_host_dsa_key" ;;
                     ssh-ed25519) hostkey_file="/etc/ssh/ssh_host_ed25519_key" ;;
+                    ssh-ed448) hostkey_file="/etc/ssh/ssh_host_ed448_key" ;;
                     ecdsa-*) hostkey_file="/etc/ssh/ssh_host_ecdsa_key" ;;
                     *) hostkey_file="/etc/ssh/ssh_host_rsa_key" ;;
                 esac
@@ -724,12 +742,13 @@ server_algo_supported() {
                 ssh-rsa|rsa-sha2-256|rsa-sha2-512) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_rsa_key$' ;;
                 ssh-dss) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_dsa_key$' ;;
                 ssh-ed25519) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ed25519_key$' ;;
+                ssh-ed448) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ed448_key$' ;;
                 ecdsa-*) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ecdsa_key$' ;;
                 ssh-sm2|sm2) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_sm2_key$' ;;
                 *) return 1 ;;
             esac
             ;;
-        *) rm -f "$tmp"; return 2 ;;
+        *) return 2 ;;
     esac
 }
 
@@ -776,12 +795,6 @@ load_dynamic_tests() {
         case "$c" in
             chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
         esac
-        # 全局去重：同一四元组只保留第一份（跨所有 loader 共享，避免重复）。
-        ADD_KEY="${k}|${c}|${m}|${h}"
-        if [[ -n "${GLOBAL_SEEN[$ADD_KEY]:-}" ]]; then
-            continue
-        fi
-        GLOBAL_SEEN["$ADD_KEY"]=1
         add_test "组合$((i+1)): kex=$k cipher=$c mac=${m:-NONE} hostkey=$h" \
             "$k" "$c" "$m" "$h" "动态轮转/组合" 2
     done
@@ -791,9 +804,6 @@ load_dynamic_tests() {
 # 原 test_centos6.sh：实际启用的 test_algo 项
 # ============================================================
 load_centos6_tests() {
-    local RSA="/etc/ssh/ssh_host_rsa_key"
-    local DSA="/etc/ssh/ssh_host_dsa_key"
-
     add_test "blowfish-cbc + hmac-sha1" \
         "diffie-hellman-group14-sha1" "blowfish-cbc" "hmac-sha1" "ssh-rsa" "Cipher" 2
     add_test "cast128-cbc + hmac-sha1" \
@@ -867,7 +877,6 @@ ssh1_binary_supported() {
         printf '%s\n' 'Protocol 1'
         printf '%s\n' 'HostKey /etc/ssh/ssh_host_key'
         printf '%s\n' 'PasswordAuthentication yes'
-        printf '%s\n' 'LogLevel DEBUG3'
     } > "$tmp"
     if "$SSHD_BIN" -t -f "$tmp" >/dev/null 2>&1; then
         rm -f "$tmp"
@@ -905,7 +914,6 @@ load_openssh8_tests() {
     (( n > 0 )) || return 0
 
     local i c m h
-    declare -A seen=()
     for ((i=0; i<n; i++)); do
         # 空维度守卫：避免 len=0 时 ${arr[$((i % len))]} 除零中止脚本。
         (( lc > 0 )) && c="${ciph_c[$((i % lc))]}" || c=""
@@ -917,12 +925,6 @@ load_openssh8_tests() {
         case "$c" in
             chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
         esac
-        # 严格去重：同一四元组只保留第一份，避免 round-robin 回绕产生重复。
-        local key="curve448-sha512|${c}|${m}|${h}"
-        if [[ -n "${seen[$key]:-}" ]]; then
-            continue
-        fi
-        seen["$key"]=1
         add_test "OpenSSH8 X448 组合$((i+1)): kex=curve448-sha512 cipher=$c mac=${m:-NONE} hostkey=$h" \
             "curve448-sha512" "$c" "$m" "$h" "OpenSSH8/X448" 2
     done
@@ -978,16 +980,13 @@ load_openeuler_tests() {
         case "$c" in
             chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
         esac
-        # 全局去重：同一四元组只保留第一份（跨所有 loader 共享）。
-        ADD_KEY="${k}|${c}|${m}|${h}"
-        if [[ -n "${GLOBAL_SEEN[$ADD_KEY]:-}" ]]; then
-            continue
-        fi
-        GLOBAL_SEEN["$ADD_KEY"]=1
         add_test "国密组合$((i+1)): kex=$k cipher=$c mac=${m:-NONE} hostkey=$h" \
             "$k" "$c" "$m" "$h" "国密/轮转" 2
     done
 }
+
+: > "$LOG_FILE"
+: > "$ENV_FILE"
 
 if ! detect_env; then
     if $LIST_ONLY; then
@@ -1021,6 +1020,15 @@ case "$PROFILE" in
         load_dynamic_tests
         ;;
     centos6)
+        # SSH-1 探测（ssh1_binary_supported）需要 /etc/ssh/ssh_host_key 存在，
+        # 但 prepare_host_keys() 在 load_centos6_tests() 之后才执行。
+        # 因此先确保 rsa1 host key 存在，使探测配置的 HostKey 指向有效文件。
+        if [[ ! -f /etc/ssh/ssh_host_key ]]; then
+            if ssh-keygen -q -t rsa1 -f /etc/ssh/ssh_host_key -N "" >/dev/null 2>&1; then
+                GENERATED_HOST_KEYS+=("/etc/ssh/ssh_host_key")
+                env_log "SSH-1 探测前预生成 HostKey: /etc/ssh/ssh_host_key"
+            fi
+        fi
         load_centos6_tests
         # SSH-1 双重判定：当前有效配置 protocol 含 1（主）且 sshd 二进制仍支持
         # SSH-1（附加）时才生成 SSH-1 测试项；否则只测 SSH-2。
@@ -1063,6 +1071,18 @@ fi
 
 acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        # 检查锁中的 PID 是否仍在运行；若已死则清理陈旧锁后重试
+        local stale_pid=""
+        [[ -f "$LOCK_DIR/pid" ]] && stale_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+        if [[ -n "$stale_pid" ]] && ! kill -0 "$stale_pid" 2>/dev/null; then
+            rm -rf "$LOCK_DIR" 2>/dev/null || true
+            if mkdir "$LOCK_DIR" 2>/dev/null; then
+                printf '%s\n' "$$" > "$LOCK_DIR/pid"
+                printf '%s\n' "$TS" > "$LOCK_DIR/start"
+                LOCK_ACQUIRED=true
+                return 0
+            fi
+        fi
         echo "错误：已有另一个 SSH 算法测试实例正在运行：$LOCK_DIR" >&2
         return 1
     fi
@@ -1078,9 +1098,6 @@ release_lock() {
         LOCK_ACQUIRED=false
     fi
 }
-
-: > "$LOG_FILE"
-: > "$ENV_FILE"
 
 env_log "SSH 算法协商测试 - 环境/执行信息"
 env_log "开始时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -1278,6 +1295,10 @@ restore_all() {
     fi
 
     rm -f /tmp/algo_client.* /tmp/algo_sshd_t.*
+    # 清理 make_test_config_from_backup / test_one / restore_after_test / restore_all
+    # 在 /etc/ssh/ 下创建的临时文件（sshd_config.XXXXXX / .restore.XXXXXX / .recover.XXXXXX），
+    # 避免 kill -9 后残留。
+    rm -f /etc/ssh/sshd_config.?????? /etc/ssh/sshd_config.restore.?????? /etc/ssh/sshd_config.recover.?????? 2>/dev/null || true
 
     # 恢复测试前服务运行状态；不因为脚本测试过程中重启过就改变原状态。
     if $INITIAL_SERVICE_KNOWN; then
@@ -1362,6 +1383,10 @@ if [[ -f "\$BACKUP" ]] && grep -qF "\$MARKER" "\$CONFIG" 2>/dev/null; then
             logger -t ssh-algo-unified "检测到异常中止测试配置，已恢复备份" 2>/dev/null || true
             rm -f "\$PIDFILE" "\$BACKUP" "\$DROPIN"
             rmdir "\$DROPIN_DIR" 2>/dev/null || true
+            # 清理可能残留的锁目录，避免后续运行报"已有实例正在运行"
+            rm -rf /var/run/ssh-algo-unified.lock 2>/dev/null || true
+            # 清理 /etc/ssh/ 下的测试临时文件
+            rm -f /etc/ssh/sshd_config.?????? /etc/ssh/sshd_config.restore.?????? /etc/ssh/sshd_config.recover.?????? 2>/dev/null || true
             systemctl daemon-reload >/dev/null 2>&1 || true
             systemctl restart "\$SERVICE" >/dev/null 2>&1 || true
         else
@@ -1430,13 +1455,15 @@ backup_config
 install_recovery
 
 prepare_crypto_policy() {
-    # 不修改系统全局 crypto-policy。测试必须反映当前发行版、当前
-    # crypto-policy 与当前 sshd 的真实可协商能力。
-    if command -v update-crypto-policies >/dev/null 2>&1; then
-        INITIAL_CRYPTO_POLICY="$(update-crypto-policies --show 2>/dev/null || true)"
-        [[ -n "$INITIAL_CRYPTO_POLICY" ]] && env_log "crypto-policy（只读）: $INITIAL_CRYPTO_POLICY"
+    # 保存当前 crypto-policy 并按需放松：modern/openssh8 画像下切换到
+    # LEGACY，使 sshd -T 探测能看到被 DEFAULT/FUTURE 策略屏蔽的算法；
+    # 测试结束后由 restore_all 恢复原始策略。
+    detect_crypto_policy_tool
+    if [[ -n "$CRYPTO_POLICY_TOOL" ]]; then
+        INITIAL_CRYPTO_POLICY="$("$CRYPTO_POLICY_TOOL" --show 2>/dev/null || true)"
+        [[ -n "$INITIAL_CRYPTO_POLICY" ]] && env_log "crypto-policy（原始）: $INITIAL_CRYPTO_POLICY"
     fi
-    CRYPTO_POLICY_CHANGED=false
+    crypto_policy_relax_for_test
 }
 
 prepare_host_keys() {
@@ -1445,6 +1472,7 @@ prepare_host_keys() {
     local key path generated_ok
     local key_list="rsa ed25519 ecdsa dsa"
     [[ "$PROFILE" == "centos6" ]] && key_list+=" rsa1"
+    [[ "$PROFILE" == "openeuler" ]] && key_list+=" sm2"
     for key in $key_list; do
         case "$key" in
             rsa) path="/etc/ssh/ssh_host_rsa_key" ;;
@@ -1452,6 +1480,7 @@ prepare_host_keys() {
             ecdsa) path="/etc/ssh/ssh_host_ecdsa_key" ;;
             dsa) path="/etc/ssh/ssh_host_dsa_key" ;;
             rsa1) path="/etc/ssh/ssh_host_key" ;;
+            sm2) path="/etc/ssh/ssh_host_sm2_key" ;;
         esac
         [[ -f "$path" ]] && continue
 
@@ -1462,6 +1491,7 @@ prepare_host_keys() {
             ecdsa) ssh-keygen -q -t ecdsa -b 521 -f "$path" -N "" >/dev/null 2>&1 && generated_ok=true ;;
             dsa) ssh-keygen -q -t dsa -f "$path" -N "" >/dev/null 2>&1 && generated_ok=true ;;
             rsa1) ssh-keygen -q -t rsa1 -f "$path" -N "" >/dev/null 2>&1 && generated_ok=true ;;
+            sm2) ssh-keygen -q -t sm2 -f "$path" -N "" >/dev/null 2>&1 && generated_ok=true ;;
         esac
 
         if $generated_ok && [[ -f "$path" ]]; then
@@ -1491,7 +1521,14 @@ prepare_auto_key() {
     # 同一工具的旧 marker 视为上次异常残留，先移除，再加入本次临时公钥。
     grep -vF "$AUTO_MARKER" /root/.ssh/authorized_keys > "$auth_tmp" 2>/dev/null || true
     printf '%s %s\n' "$(cat "$AUTO_PUB")" "$AUTO_MARKER" >> "$auth_tmp"
-    if [[ "$PROFILE" == "centos6" ]]; then
+    # 仅当实际存在 SSH-1 测试项时才生成 RSA1 密钥，避免因 SSH-1 测试
+    # 被跳过时仍因 rsa1 生成失败而 die 退出。
+    local has_ssh1=false
+    local _p
+    for _p in "${PROTOCOLS[@]}"; do
+        [[ "$_p" == "1" ]] && { has_ssh1=true; break; }
+    done
+    if [[ "$PROFILE" == "centos6" ]] && $has_ssh1; then
         if ! ssh-keygen -t rsa1 -b 1024 -f "$AUTO_SSH1_KEY" -N "" -q 2>/dev/null ||
            [[ ! -s "$AUTO_SSH1_PUB" ]]; then
             rm -f "$auth_tmp" "$AUTO_SSH1_KEY" "$AUTO_SSH1_PUB"
@@ -1589,7 +1626,7 @@ should_run() {
     [[ -z "$ONLY_FILTER" ]] && return 0
 
     if [[ "$ONLY_FILTER" =~ ^[0-9]+$ ]]; then
-        [[ "$idx" == "$ONLY_FILTER" ]]
+        [[ "$((10#$idx))" == "$((10#$ONLY_FILTER))" ]]
         return
     fi
 
@@ -1824,6 +1861,9 @@ algo_effective_supported() {
                 ssh-ed25519)
                     printf '%s\n' "$EFFECTIVE_HOSTKEY" | grep -Eq '(^|/)ssh_host_ed25519_key$' && return 0
                     ;;
+                ssh-ed448)
+                    printf '%s\n' "$EFFECTIVE_HOSTKEY" | grep -Eq '(^|/)ssh_host_ed448_key$' && return 0
+                    ;;
                 ecdsa-*)
                     printf '%s\n' "$EFFECTIVE_HOSTKEY" | grep -Eq '(^|/)ssh_host_ecdsa_key$' && return 0
                     ;;
@@ -1832,40 +1872,10 @@ algo_effective_supported() {
                     ;;
                 *) return 1 ;;
             esac
-            return 1
             ;;
         *) return 0 ;;
     esac
     printf '%s\n' "$list" | grep -qxF "$algo"
-}
-
-algo_supported() {
-    local type="$1" algo="$2" list=""
-    [[ -n "$algo" ]] || return 0
-    case "$type" in
-        kex) list="$SUPPORTED_KEX" ;;
-        cipher) list="$SUPPORTED_CIPHER" ;;
-        mac) list="$SUPPORTED_MAC" ;;
-        key) list="$SUPPORTED_HOSTKEY" ;;
-        *) return 0 ;;
-    esac
-    [[ -z "$list" ]] && return 2
-    if printf '%s\n' "$list" | grep -qxF "$algo"; then
-        return 0
-    fi
-    if [[ "$type" == "key" ]]; then
-        case "$algo" in
-            rsa-sha2-512|rsa-sha2-256|ssh-rsa)
-                if printf '%s\n' "$list" | grep -Eq '^(ssh-rsa|rsa-sha2-256|rsa-sha2-512)$'; then
-                    return 0
-                fi
-                ;;
-            ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)
-                if printf '%s\n' "$list" | grep -qxF "$algo"; then return 0; fi
-                ;;
-        esac
-    fi
-    return 1
 }
 
 make_test_config_from_backup() {
@@ -1879,12 +1889,15 @@ make_test_config_from_backup() {
         printf '%s\n' '# ALGO_TEST_ACTIVE_MARKER_DO_NOT_EDIT'
         printf '%s\n' "# 测试项: [#${idx}] ${desc}"
         printf '%s\n' "Port ${PORT}"
-        printf '%s\n' 'ListenAddress 127.0.0.1'
+        if $AUTO; then
+            printf '%s\n' 'ListenAddress 127.0.0.1'
+        fi
         if [[ "$proto" == "1" ]]; then
             printf '%s\n' \
                 'Protocol 1' \
                 'PermitRootLogin yes' \
                 'PasswordAuthentication yes' \
+                'RSAAuthentication yes' \
                 'UsePAM yes' \
                 "Cipher ${ssh1cipher}" \
                 'HostKey /etc/ssh/ssh_host_key' \
@@ -1909,9 +1922,8 @@ make_test_config_from_backup() {
             # sshd -t 校验失败（bad configuration option）。
             # 因此仅当 OpenSSH >= 6.5 时才写入；旧版本通过下方
             # HostKey 指令指定 key 文件来决定 host key 算法。
-                if [[ -n "$SSHD_VER_MAJOR" ]] && \
-                    (( SSHD_VER_MAJOR > 6 )) || \
-                    { [[ "$SSHD_VER_MAJOR" == 6 ]] && (( SSHD_VER_MINOR >= 5 )); }; then
+            if [[ -n "$SSHD_VER_MAJOR" ]] && \
+                { (( SSHD_VER_MAJOR > 6 )) || { [[ "$SSHD_VER_MAJOR" == 6 ]] && (( SSHD_VER_MINOR >= 5 )); }; }; then
                 printf '%s\n' "HostKeyAlgorithms ${hostkey}"
             fi
             if [[ -n "$compression" ]]; then
@@ -1924,6 +1936,7 @@ make_test_config_from_backup() {
             case "$hostkey" in
                 ssh-dss) printf '%s\n' 'HostKey /etc/ssh/ssh_host_dsa_key' ;;
                 ssh-ed25519) printf '%s\n' 'HostKey /etc/ssh/ssh_host_ed25519_key' ;;
+                ssh-ed448) printf '%s\n' 'HostKey /etc/ssh/ssh_host_ed448_key' ;;
                 ecdsa-*) printf '%s\n' 'HostKey /etc/ssh/ssh_host_ecdsa_key' ;;
                 ssh-sm2|sm2) printf '%s\n' 'HostKey /etc/ssh/ssh_host_sm2_key' ;;
                 *) printf '%s\n' 'HostKey /etc/ssh/ssh_host_rsa_key' ;;
@@ -1935,10 +1948,10 @@ make_test_config_from_backup() {
     # 原配置全部保留；仅注释全局范围内与本次测试直接冲突的指令。
     awk '
         BEGIN { in_match=0 }
-        /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]+[Aa][Ll][Ll]([[:space:]]|$)/ { in_match=0; next }
+        /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]+[Aa][Ll][Ll]([[:space:]]|$)/ { in_match=0; print; next }
         /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh]([[:space:]]|$)/ { in_match=1 }
         {
-            if (!in_match && $0 ~ /^[[:space:]]*(Port|ListenAddress|Protocol|KexAlgorithms|Ciphers|MACs|HostKeyAlgorithms|HostKey|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|UsePAM|LogLevel|Compression)[[:space:]]+/) {
+            if (!in_match && $0 ~ /^[[:space:]]*(Port|ListenAddress|Protocol|KexAlgorithms|Ciphers|Cipher|MACs|HostKeyAlgorithms|HostKey|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|UsePAM|LogLevel|Compression|Include)[[:space:]]+/) {
                 print "# UNIFIED_TEST_COMMENTED: " $0
             } else {
                 print
@@ -2011,6 +2024,20 @@ run_auto_ssh2() {
         hostkey_opt="-o HostKeyAlgorithms=$hostkey"
     fi
 
+    # KexAlgorithms 作为 ssh 客户端选项在 OpenSSH 5.4 才引入；
+    # CentOS 6 的 OpenSSH 5.3 客户端不支持，传了会报 Bad configuration option。
+    # 旧版本客户端不限制 KEX，服务端配置已经固定了 KEX，客户端会自动从
+    # 服务端提议中接受；因此 5.3 客户端不传该选项即可。
+    local kex_opt=""
+    if [[ -n "$SSH_VER_MAJOR" ]] && (( SSH_VER_MAJOR >= 6 )); then
+        kex_opt="-o KexAlgorithms=$kex"
+    fi
+
+    local identity_opt=""
+    if [[ -n "$SSH_VER_MAJOR" ]] && (( SSH_VER_MAJOR >= 6 )); then
+        identity_opt="-o IdentitiesOnly=yes"
+    fi
+
     ssh -vvv \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
@@ -2018,9 +2045,9 @@ run_auto_ssh2() {
         -o ConnectionAttempts=1 \
         -o BatchMode=yes \
         -o PreferredAuthentications=publickey \
-        -o IdentitiesOnly=yes \
+        $identity_opt \
         -i "$AUTO_KEY" \
-        -o KexAlgorithms="$kex" \
+        $kex_opt \
         -o Ciphers="$cipher" \
         $mac_opt \
         $hostkey_opt \
@@ -2034,6 +2061,11 @@ run_auto_ssh1() {
 
     # SSH-1 自动模式也用临时公钥做 RSA 认证（与 SSH-2 一致），
     # 避免 BatchMode=yes + 无密码导致认证必失败。
+    local identity_opt=""
+    if [[ -n "$SSH_VER_MAJOR" ]] && (( SSH_VER_MAJOR >= 6 )); then
+        identity_opt="-o IdentitiesOnly=yes"
+    fi
+
     ssh -vvv -1 \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
@@ -2041,7 +2073,7 @@ run_auto_ssh1() {
         -o ConnectionAttempts=1 \
         -o BatchMode=yes \
         -o PreferredAuthentications=publickey \
-        -o IdentitiesOnly=yes \
+        $identity_opt \
         -i "$AUTO_SSH1_KEY" \
         -p "$PORT" \
         -c "$cipher" \
@@ -2062,6 +2094,7 @@ load_supported_algorithms
 
 restore_after_test() {
     local reason="${1:-测试项结束恢复}"
+    local skip_restart="${2:-false}"
     local restore_tmp=""
 
     if [[ -f "$BACKUP_FILE" ]]; then
@@ -2074,7 +2107,9 @@ restore_after_test() {
         fi
     fi
 
-    if $INITIAL_SERVICE_KNOWN; then
+    # 仅在配置确实被 mv 替换后才需要重启服务恢复；
+    # sshd -t/-T 失败路径（配置未替换）传 skip_restart=true 避免不必要的服务中断。
+    if ! $skip_restart && $INITIAL_SERVICE_KNOWN; then
         if $INITIAL_SERVICE_ACTIVE; then
             service_restart >/dev/null 2>&1 || log "[恢复] WARNING：$reason：sshd 无法恢复为运行状态"
         else
@@ -2250,7 +2285,7 @@ test_one() {
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
         rm -f "$tmp"
-        restore_after_test "临时配置 -T 校验失败"
+        restore_after_test "临时配置 -T 校验失败" true
         return 0
     fi
 
@@ -2275,7 +2310,7 @@ test_one() {
             record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
                 "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
             rm -f "$tmp"
-            restore_after_test "算法不在临时配置有效集合"
+            restore_after_test "算法不在临时配置有效集合" true
             return 0
         fi
     fi
@@ -2636,10 +2671,6 @@ test_one() {
 
     if [[ "$NR" == "PASS" && "$AR" == "UNKNOWN" && -z "$reason" ]]; then
         reason="协商成功；认证状态无法从当前日志准确确定"
-    fi
-
-    if [[ -z "$reason" ]]; then
-        reason=""
     fi
 
     if [[ "$proto" == "1" ]]; then
