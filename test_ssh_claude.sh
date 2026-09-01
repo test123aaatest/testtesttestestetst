@@ -143,6 +143,9 @@ INIT="unknown"
 PROFILE="unknown"
 
 declare -a DESCS KEXES CIPHERS MACS HOSTKEYS TEST_GROUPS PROTOCOLS COMPRESSIONS DEFAULT_FLAGS
+# 跨 loader 共享的去重集合：所有动态生成器共用，避免 openssh8 等多 loader
+# 场景下不同生成器产生重复四元组。bash 关联数组，需 bash>=4。
+declare -A GLOBAL_SEEN
 
 detect_crypto_policy_tool() {
     CRYPTO_POLICY_TOOL=""
@@ -466,14 +469,18 @@ default_algorithm_supported() {
                 return 0
             fi
             case "$algo" in
-                ssh-rsa|rsa-sha2-256|rsa-sha2-512)
+                ssh-rsa|ssh-rsa-cert-v01@openssh.com|rsa-sha2-256|rsa-sha2-256-cert-v01@openssh.com|rsa-sha2-512|rsa-sha2-512-cert-v01@openssh.com)
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_rsa_key$' && return 0 ;;
-                ssh-dss)
+                ssh-dss|ssh-dss-cert-v01@openssh.com)
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_dsa_key$' && return 0 ;;
-                ssh-ed25519)
+                ssh-ed25519|ssh-ed25519-cert-v01@openssh.com)
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_ed25519_key$' && return 0 ;;
-                ecdsa-*)
+                ssh-ed448)
+                    printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_ed448_key$' && return 0 ;;
+                ecdsa-*|ecdsa-sha2-nistp256-cert-v01@openssh.com|ecdsa-sha2-nistp384-cert-v01@openssh.com|ecdsa-sha2-nistp521-cert-v01@openssh.com)
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_ecdsa_key$' && return 0 ;;
+                ssh-sm2|sm2)
+                    printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_sm2_key$' && return 0 ;;
             esac
             return 1
             ;;
@@ -754,18 +761,27 @@ load_dynamic_tests() {
     local lk=${#kex_c[@]} lc=${#ciph_c[@]} lm=${#mac_c[@]} lh=${#hk_c[@]}
     local n=$((lk > lc ? lk : (lc > lm ? lc : (lm > lh ? lm : lh))))
     (( n > 0 )) || return 0
-    if (( n == 0 )); then return 0; fi
 
     local i k c m h
     for ((i=0; i<n; i++)); do
-        k="${kex_c[$((i % lk))]}"
-        c="${ciph_c[$((i % lc))]}"
-        m="${mac_c[$((i % lm))]}"
-        h="${hk_c[$((i % lh))]}"
-        # AEAD cipher 不协商传统 MAC，MAC 置空。
+        # 空维度守卫：某维度候选为空（全部被过滤掉）时，该维度置空，
+        # 避免在 len=0 时 ${arr[$((i % len))]} 除零中止脚本。
+        (( lk > 0 )) && k="${kex_c[$((i % lk))]}" || k=""
+        (( lc > 0 )) && c="${ciph_c[$((i % lc))]}" || c=""
+        (( lm > 0 )) && m="${mac_c[$((i % lm))]}" || m=""
+        (( lh > 0 )) && h="${hk_c[$((i % lh))]}" || h=""
+        # kex / cipher / hostkey 是协商必需维度，三者任一为空则该组合无法协商，跳过。
+        [[ -n "$k" && -n "$c" && -n "$h" ]] || continue
+        # AEAD cipher 不协商传统 MAC，MAC 置空（置空后再参与去重 key，保证一致）。
         case "$c" in
             chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
         esac
+        # 全局去重：同一四元组只保留第一份（跨所有 loader 共享，避免重复）。
+        ADD_KEY="${k}|${c}|${m}|${h}"
+        if [[ -n "${GLOBAL_SEEN[$ADD_KEY]:-}" ]]; then
+            continue
+        fi
+        GLOBAL_SEEN["$ADD_KEY"]=1
         add_test "组合$((i+1)): kex=$k cipher=$c mac=${m:-NONE} hostkey=$h" \
             "$k" "$c" "$m" "$h" "动态轮转/组合" 2
     done
@@ -889,13 +905,24 @@ load_openssh8_tests() {
     (( n > 0 )) || return 0
 
     local i c m h
+    declare -A seen=()
     for ((i=0; i<n; i++)); do
-        c="${ciph_c[$((i % lc))]}"
-        m="${mac_c[$((i % lm))]}"
-        h="${hk_c[$((i % lh))]}"
+        # 空维度守卫：避免 len=0 时 ${arr[$((i % len))]} 除零中止脚本。
+        (( lc > 0 )) && c="${ciph_c[$((i % lc))]}" || c=""
+        (( lm > 0 )) && m="${mac_c[$((i % lm))]}" || m=""
+        (( lh > 0 )) && h="${hk_c[$((i % lh))]}" || h=""
+        # cipher / hostkey 是协商必需维度，任一为空则无法协商，跳过。
+        [[ -n "$c" && -n "$h" ]] || continue
+        # AEAD cipher 不协商传统 MAC，MAC 置空（置空后再参与去重 key）。
         case "$c" in
             chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
         esac
+        # 严格去重：同一四元组只保留第一份，避免 round-robin 回绕产生重复。
+        local key="curve448-sha512|${c}|${m}|${h}"
+        if [[ -n "${seen[$key]:-}" ]]; then
+            continue
+        fi
+        seen["$key"]=1
         add_test "OpenSSH8 X448 组合$((i+1)): kex=curve448-sha512 cipher=$c mac=${m:-NONE} hostkey=$h" \
             "curve448-sha512" "$c" "$m" "$h" "OpenSSH8/X448" 2
     done
@@ -940,15 +967,23 @@ load_openeuler_tests() {
 
     local i k c m h
     for ((i=0; i<n; i++)); do
-        k="${kex_c[$((i % lk))]}"
-        c="${ciph_c[$((i % lc))]}"
-        m="${mac_c[$((i % lm))]}"
-        h="${hk_c[$((i % lh))]}"
+        # 空维度守卫：避免 len=0 时 ${arr[$((i % len))]} 除零中止脚本。
+        (( lk > 0 )) && k="${kex_c[$((i % lk))]}" || k=""
+        (( lc > 0 )) && c="${ciph_c[$((i % lc))]}" || c=""
+        (( lm > 0 )) && m="${mac_c[$((i % lm))]}" || m=""
+        (( lh > 0 )) && h="${hk_c[$((i % lh))]}" || h=""
+        # kex / cipher / hostkey 是协商必需维度，三者任一为空则无法协商，跳过。
+        [[ -n "$k" && -n "$c" && -n "$h" ]] || continue
+        # AEAD cipher 不协商传统 MAC，MAC 置空（置空后再参与去重 key，保证一致）。
         case "$c" in
             chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
         esac
-        # 锚点：确保国密元素（sm4-ctr / hmac-sm3 / ssh-sm2 / sm2-sm3）在轮转中
-        # 至少挂到一组合上；add_test 会再经 server_candidate_supported 过滤。
+        # 全局去重：同一四元组只保留第一份（跨所有 loader 共享）。
+        ADD_KEY="${k}|${c}|${m}|${h}"
+        if [[ -n "${GLOBAL_SEEN[$ADD_KEY]:-}" ]]; then
+            continue
+        fi
+        GLOBAL_SEEN["$ADD_KEY"]=1
         add_test "国密组合$((i+1)): kex=$k cipher=$c mac=${m:-NONE} hostkey=$h" \
             "$k" "$c" "$m" "$h" "国密/轮转" 2
     done
