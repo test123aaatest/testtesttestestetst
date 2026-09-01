@@ -657,199 +657,118 @@ add_test() {
 }
 
 # ============================================================
-# 原 test_algorithms.sh：实际启用的 test_algo 项
-# ============================================================
-# ============================================================
 # 动态生成：按 Worker 安全排序轮转各维度
 # ============================================================
-load_dynamic_tests() {
-    # 以 load_worker_algorithms 的安全排序为基准（按 Worker 客户端实际能力，
-    # 安全性从高到低）。服务器能力由 add_test 内的 server_candidate_supported
-    # 用真实 -t/-T 校验，最终每个可测项都会过这一层。
-    # 生成方法：对 Cipher / KEX / HostKey / MAC 四个维度逐一固定遍历，
-    # 其它维度固定取各自 worker 列表的第一位（即最安全的一个）构成组合。
-    local base_kex base_cipher base_mac base_hk
-    base_kex="$(printf '%s\n' "$WORKER_KEX" | head -n1)"
-    base_cipher="$(printf '%s\n' "$WORKER_CIPHERS" | head -n1)"
-    base_mac="$(printf '%s\n' "$WORKER_MACS" | head -n1)"
-    base_hk="$(printf '%s\n' "$WORKER_HOSTKEYS" | head -n1)"
-    # 若固定的基准 Cipher 是 AEAD（chacha20/AES-GCM），它不协商传统 MAC，
-    # 其它轮转组的 base_mac 也应置空，避免给 AEAD 误配 MAC。
-    case "$base_cipher" in
-        chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)
-            base_mac="" ;;
-    esac
 
-    local algo
-    # ---- 组1: Cipher 轮转 ----
-    while IFS= read -r algo; do
-        [[ -n "$algo" ]] || continue
-        # AEAD（chacha20-poly1305 / AES-GCM）不协商传统 MAC，不给它配 MAC。
-        case "$algo" in
-            chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)
-                add_test "cipher: $algo" "$base_kex" "$algo" "" "$base_hk" "Cipher/轮转" 2 ;;
-            *)
-                add_test "cipher: $algo" "$base_kex" "$algo" "$base_mac" "$base_hk" "Cipher/轮转" 2 ;;
+# 单算法能力探测：判断服务器 sshd（-T）当前是否真的支持某维度单算法。
+# 对 kex/cipher/mac 用"仅保留该算法"的临时配置做 -t/-T 校验；
+# hostkey 需额外校验对应 host key 文件是否存在。
+# 返回：0=支持 1=不支持 2=无法探测。
+server_algo_supported() {
+    local type="$1" algo="$2"
+    local tmp out hostkey_file
+    [[ -n "$SSHD_BIN" && -f "$SSHD_CONFIG" ]] || return 2
+    [[ -n "$algo" ]] || return 0
+
+    tmp="$(mktemp /tmp/ssh_algo_single.XXXXXX)" || return 2
+    {
+        printf '%s\n' '# SSH_ALGO_SINGLE_PROBE'
+        printf '%s\n' 'Protocol 2'
+        case "$type" in
+            kex)    printf '%s\n' "KexAlgorithms $algo" ;;
+            cipher) printf '%s\n' "Ciphers $algo" ;;
+            mac)    printf '%s\n' "MACs $algo" ;;
+            hostkey)
+                case "$algo" in
+                    ssh-sm2|sm2) hostkey_file="/etc/ssh/ssh_host_sm2_key" ;;
+                    ssh-dss) hostkey_file="/etc/ssh/ssh_host_dsa_key" ;;
+                    ssh-ed25519) hostkey_file="/etc/ssh/ssh_host_ed25519_key" ;;
+                    ecdsa-*) hostkey_file="/etc/ssh/ssh_host_ecdsa_key" ;;
+                    *) hostkey_file="/etc/ssh/ssh_host_rsa_key" ;;
+                esac
+                [[ -f "$hostkey_file" ]] || { rm -f "$tmp"; return 1; }
+                printf '%s\n' "HostKey $hostkey_file"
+                if [[ -n "$SSHD_VER_MAJOR" ]] && { (( SSHD_VER_MAJOR > 6 )) || { (( SSHD_VER_MAJOR == 6 )) && (( SSHD_VER_MINOR >= 5 )); }; }; then
+                    printf '%s\n' "HostKeyAlgorithms $algo"
+                fi
+                ;;
         esac
-    done <<< "$WORKER_CIPHERS"
+        cat "$SSHD_CONFIG"
+    } > "$tmp"
 
-    # ---- 组2: KEX 轮转 ----
-    while IFS= read -r algo; do
-        [[ -n "$algo" ]] || continue
-        add_test "kex: $algo" "$algo" "$base_cipher" "$base_mac" "$base_hk" "KEX/轮转" 2
-    done <<< "$WORKER_KEX"
+    if ! "$SSHD_BIN" -t -f "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"; return 1
+    fi
+    out="$("$SSHD_BIN" -T -f "$tmp" 2>/dev/null)" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
 
-    # ---- 组3: HostKey 轮转 ----
-    while IFS= read -r algo; do
-        [[ -n "$algo" ]] || continue
-        add_test "hostkey: $algo" "$base_kex" "$base_cipher" "$base_mac" "$algo" "HostKey/轮转" 2
-    done <<< "$WORKER_HOSTKEYS"
-
-    # ---- 组4: MAC 轮转 ----
-    while IFS= read -r algo; do
-        [[ -n "$algo" ]] || continue
-        add_test "mac: $algo" "$base_kex" "$base_cipher" "$algo" "$base_hk" "MAC/轮转" 2
-    done <<< "$WORKER_MACS"
+    case "$type" in
+        kex)
+            printf '%s\n' "$out" | awk '$1=="kexalgorithms" {print $2}' | tr ',' '\n' | grep -qxF "$algo" ;;
+        cipher)
+            printf '%s\n' "$out" | awk '$1=="ciphers" {print $2}' | tr ',' '\n' | grep -qxF "$algo" ;;
+        mac)
+            printf '%s\n' "$out" | awk '$1=="macs" {print $2}' | tr ',' '\n' | grep -qxF "$algo" ;;
+        hostkey)
+            if printf '%s\n' "$out" | awk '$1=="hostkeyalgorithms" {print $2}' | tr ',' '\n' | grep -qxF "$algo"; then
+                return 0
+            fi
+            case "$algo" in
+                ssh-rsa|rsa-sha2-256|rsa-sha2-512) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_rsa_key$' ;;
+                ssh-dss) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_dsa_key$' ;;
+                ssh-ed25519) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ed25519_key$' ;;
+                ecdsa-*) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_ecdsa_key$' ;;
+                ssh-sm2|sm2) printf '%s\n' "$out" | awk '$1=="hostkey" {print $2}' | grep -Eq '(^|/)ssh_host_sm2_key$' ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) rm -f "$tmp"; return 2 ;;
+    esac
 }
 
-load_modern_tests() {
-    local CHACHA="chacha20-poly1305@openssh.com"
-    local G256="aes256-gcm@openssh.com"
-    local G128="aes128-gcm@openssh.com"
-    local H256E="hmac-sha2-256-etm@openssh.com"
-    local H512E="hmac-sha2-512-etm@openssh.com"
-    local U128E="umac-128-etm@openssh.com"
-    local U64E="umac-64-etm@openssh.com"
-    local H1E="hmac-sha1-etm@openssh.com"
-    local H196E="hmac-sha1-96-etm@openssh.com"
-    local M5E="hmac-md5-etm@openssh.com"
-    local M596E="hmac-md5-96-etm@openssh.com"
-    local U128="umac-128@openssh.com"
-    local U64="umac-64@openssh.com"
-    local COLD="curve25519-sha256@libssh.org"
+load_dynamic_tests() {
+    # 方案 A：先预过滤（Worker 已在 WORKER_*；服务器用 server_algo_supported
+    # 逐个 -T 校验），构建"每维度有效候选集"；再按 round-robin 同步推进生成
+    # 四元组（kex/cipher/mac/hostkey 同序号），以最长维度为界、循环回绕，
+    # 保证每个算法至少出现一次（全覆盖）、组合不重复、数量 = 最长维度长。
+    local kex_c=() ciph_c=() mac_c=() hk_c=()
+    local algo
 
-    add_test "chacha20-poly1305" \
-        "curve25519-sha256" "$CHACHA" "$H256E" "ssh-ed25519" "Cipher/AEAD" 2
-    add_test "aes256-gcm" \
-        "curve25519-sha256" "$G256" "$H256E" "ssh-ed25519" "Cipher/AEAD" 2
-    add_test "aes128-gcm" \
-        "curve25519-sha256" "$G128" "$H256E" "ssh-ed25519" "Cipher/AEAD" 2
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported kex "$algo"; then kex_c+=("$algo"); fi
+    done <<< "$WORKER_KEX"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported cipher "$algo"; then ciph_c+=("$algo"); fi
+    done <<< "$WORKER_CIPHERS"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported mac "$algo"; then mac_c+=("$algo"); fi
+    done <<< "$WORKER_MACS"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported hostkey "$algo"; then hk_c+=("$algo"); fi
+    done <<< "$WORKER_HOSTKEYS"
 
-    add_test "aes256-ctr" \
-        "curve25519-sha256" "aes256-ctr" "$H256E" "ssh-ed25519" "Cipher/CTR" 2
-    add_test "aes192-ctr" \
-        "curve25519-sha256" "aes192-ctr" "$H256E" "ssh-ed25519" "Cipher/CTR" 2
-    add_test "aes128-ctr" \
-        "curve25519-sha256" "aes128-ctr" "$H256E" "ssh-ed25519" "Cipher/CTR" 2
-    add_test "3des-ctr" \
-        "curve25519-sha256" "3des-ctr" "hmac-sha2-256" "ssh-ed25519" "Cipher/CTR" 2
+    local lk=${#kex_c[@]} lc=${#ciph_c[@]} lm=${#mac_c[@]} lh=${#hk_c[@]}
+    local n=$((lk > lc ? lk : (lc > lm ? lc : (lm > lh ? lm : lh))))
+    (( n > 0 )) || return 0
+    if (( n == 0 )); then return 0; fi
 
-    add_test "aes256-cbc" \
-        "curve25519-sha256" "aes256-cbc" "hmac-sha2-512" "ssh-ed25519" "Cipher/CBC" 2
-    add_test "aes192-cbc" \
-        "curve25519-sha256" "aes192-cbc" "hmac-sha1" "ssh-ed25519" "Cipher/CBC" 2
-    add_test "aes128-cbc" \
-        "curve25519-sha256" "aes128-cbc" "hmac-sha1-96" "ssh-ed25519" "Cipher/CBC" 2
-    add_test "3des-cbc (Sweet32)" \
-        "curve25519-sha256" "3des-cbc" "hmac-md5" "ssh-ed25519" "Cipher/CBC" 2
-
-    add_test "mlkem768x25519-sha256 (后量子+ECDH)" \
-        "mlkem768x25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "sntrup761x25519-sha512@openssh.com (后量子+ECDH)" \
-        "sntrup761x25519-sha512@openssh.com" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "sntrup761x25519-sha512 (后量子+ECDH, 无后缀)" \
-        "sntrup761x25519-sha512" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "curve25519-sha256" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "curve25519-sha256 (旧别名)" \
-        "$COLD" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "curve448-sha512 (X448)" \
-        "curve448-sha512" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "ecdh-sha2-nistp521" \
-        "ecdh-sha2-nistp521" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "ecdh-sha2-nistp384" \
-        "ecdh-sha2-nistp384" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "ecdh-sha2-nistp256" \
-        "ecdh-sha2-nistp256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group18-sha512 (8192-bit)" \
-        "diffie-hellman-group18-sha512" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group16-sha512 (4096-bit)" \
-        "diffie-hellman-group16-sha512" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group14-sha256 (2048-bit)" \
-        "diffie-hellman-group14-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group-exchange-sha256" \
-        "diffie-hellman-group-exchange-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group-exchange-sha512" \
-        "diffie-hellman-group-exchange-sha512" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group14-sha1 (2048-bit, SHA-1)" \
-        "diffie-hellman-group14-sha1" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group-exchange-sha1" \
-        "diffie-hellman-group-exchange-sha1" "aes256-ctr" "hmac-sha1" "ssh-ed25519" "KEX" 2
-    add_test "diffie-hellman-group1-sha1 (1024-bit, Logjam)" \
-        "diffie-hellman-group1-sha1" "aes256-ctr" "hmac-sha1" "ssh-ed25519" "KEX" 2
-
-    add_test "ssh-ed25519" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "HostKey" 2
-    add_test "ecdsa-sha2-nistp521" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ecdsa-sha2-nistp521" "HostKey" 2
-    add_test "ecdsa-sha2-nistp384" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ecdsa-sha2-nistp384" "HostKey" 2
-    add_test "ecdsa-sha2-nistp256" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ecdsa-sha2-nistp256" "HostKey" 2
-    add_test "rsa-sha2-512" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "rsa-sha2-512" "HostKey" 2
-    add_test "rsa-sha2-256" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "rsa-sha2-256" "HostKey" 2
-    add_test "ssh-rsa (SHA-1 签名, 已弃用)" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-rsa" "HostKey" 2
-
-    add_test "hmac-sha2-512-etm" \
-        "curve25519-sha256" "aes256-ctr" "$H512E" "ssh-ed25519" "MAC" 2
-    add_test "hmac-sha2-256-etm" \
-        "curve25519-sha256" "aes256-ctr" "$H256E" "ssh-ed25519" "MAC" 2
-    add_test "umac-128-etm" \
-        "curve25519-sha256" "aes256-ctr" "$U128E" "ssh-ed25519" "MAC" 2
-    add_test "umac-64-etm" \
-        "curve25519-sha256" "aes256-ctr" "$U64E" "ssh-ed25519" "MAC" 2
-    add_test "hmac-sha2-512" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-512" "ssh-ed25519" "MAC" 2
-    add_test "hmac-sha2-256" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "MAC" 2
-    add_test "umac-128" \
-        "curve25519-sha256" "aes256-ctr" "$U128" "ssh-ed25519" "MAC" 2
-    add_test "umac-64" \
-        "curve25519-sha256" "aes256-ctr" "$U64" "ssh-ed25519" "MAC" 2
-    add_test "hmac-sha1-etm" \
-        "curve25519-sha256" "aes256-ctr" "$H1E" "ssh-ed25519" "MAC" 2
-    add_test "hmac-sha1" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha1" "ssh-ed25519" "MAC" 2
-    add_test "hmac-sha1-96-etm" \
-        "curve25519-sha256" "aes256-ctr" "$H196E" "ssh-ed25519" "MAC" 2
-    add_test "hmac-sha1-96" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha1-96" "ssh-ed25519" "MAC" 2
-    add_test "hmac-md5-etm" \
-        "curve25519-sha256" "aes256-ctr" "$M5E" "ssh-ed25519" "MAC" 2
-    add_test "hmac-md5" \
-        "curve25519-sha256" "aes256-ctr" "hmac-md5" "ssh-ed25519" "MAC" 2
-    add_test "hmac-md5-96-etm" \
-        "curve25519-sha256" "aes256-ctr" "$M596E" "ssh-ed25519" "MAC" 2
-    add_test "hmac-md5-96" \
-        "curve25519-sha256" "aes256-ctr" "hmac-md5-96" "ssh-ed25519" "MAC" 2
-
-    # ---- Compression ----
-    add_test "compression zlib@openssh.com (延迟压缩)" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "Compression" 2 \
-        "zlib@openssh.com"
-    add_test "compression zlib (标准压缩)" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "Compression" 2 \
-        "zlib"
-    add_test "compression none (无压缩)" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "Compression" 2 \
-        "none"
-
-    # ---- Legacy 组合 ----
-    add_test "全遗留: group1 + 3des + md5 + ssh-rsa" \
-        "diffie-hellman-group1-sha1" "3des-cbc" "hmac-md5" "ssh-rsa" "Legacy" 2
+    local i k c m h
+    for ((i=0; i<n; i++)); do
+        k="${kex_c[$((i % lk))]}"
+        c="${ciph_c[$((i % lc))]}"
+        m="${mac_c[$((i % lm))]}"
+        h="${hk_c[$((i % lh))]}"
+        # AEAD cipher 不协商传统 MAC，MAC 置空。
+        case "$c" in
+            chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
+        esac
+        add_test "组合$((i+1)): kex=$k cipher=$c mac=${m:-NONE} hostkey=$h" \
+            "$k" "$c" "$m" "$h" "动态轮转/组合" 2
+    done
 }
 
 # ============================================================
@@ -909,24 +828,130 @@ load_ssh1_tests() {
     add_test "SSH-1: des" "" "des" "" "ssh-rsa1" "SSH-1 Cipher" 1
 }
 
+# SSH-1 测试双重判定：
+#   主条件：当前 sshd 有效配置（sshd -T）的 protocol 是否包含 "1"。
+#           （若当前只有 Protocol 2，测试配置改写为 1 后必然被拒，测不了。）
+#   附加条件：该 sshd 二进制是否仍支持 SSH-1——用含 Protocol 1 的临时配置做
+#            sshd -t 试探；通过才说明"改为 1 协议后真能跑起来"。
+# 两个条件都满足才生成 SSH-1 测试项，否则跳过（只测 SSH-2）。
+
+sshd_effective_protocol_has_1() {
+    [[ -n "$SSHD_BIN" && -f "$SSHD_CONFIG" ]] || return 1
+    local out
+    out="$("$SSHD_BIN" -T -f "$SSHD_CONFIG" 2>/dev/null | awk '$1 == "protocol" { print $2, $3, $4 }' | tr ' ' '\n' | tr ',' '\n')"
+    printf '%s\n' "$out" | grep -qx "1"
+}
+
+ssh1_binary_supported() {
+    [[ -n "$SSHD_BIN" ]] || return 1
+    local tmp
+    tmp="$(mktemp /tmp/ssh1probe.XXXXXX 2>/dev/null)" || return 1
+    {
+        printf '%s\n' '# SSH1_PROBE'
+        printf '%s\n' 'Protocol 1'
+        printf '%s\n' 'HostKey /etc/ssh/ssh_host_key'
+        printf '%s\n' 'PasswordAuthentication yes'
+        printf '%s\n' 'LogLevel DEBUG3'
+    } > "$tmp"
+    if "$SSHD_BIN" -t -f "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # ============================================================
 # 原 test_openssh8.sh：实际启用的 1 项
 # ============================================================
 load_openssh8_tests() {
-    add_test "curve448-sha512 (X448)" \
-        "curve448-sha512" "aes256-ctr" "hmac-sha2-256" "ssh-ed25519" "OpenSSH8/X448" 2
+    # X448（curve448-sha512）是 OpenSSH 8.x 专项 KEX。同样采用方案 A：
+    # 固定 X448 为 kex 锚点，其它维度（cipher/mac/hostkey）用 server_algo_supported
+    # 预过滤构建有效候选集，再按 round-robin 全覆盖不重复地生成组合。
+    local ciph_c=() mac_c=() hk_c=()
+    local algo
+
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported cipher "$algo"; then ciph_c+=("$algo"); fi
+    done <<< "$WORKER_CIPHERS"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported mac "$algo"; then mac_c+=("$algo"); fi
+    done <<< "$WORKER_MACS"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported hostkey "$algo"; then hk_c+=("$algo"); fi
+    done <<< "$WORKER_HOSTKEYS"
+
+    local lc=${#ciph_c[@]} lm=${#mac_c[@]} lh=${#hk_c[@]}
+    local n=$((lc > lm ? lc : (lm > lh ? lm : lh)))
+    (( n > 0 )) || return 0
+
+    local i c m h
+    for ((i=0; i<n; i++)); do
+        c="${ciph_c[$((i % lc))]}"
+        m="${mac_c[$((i % lm))]}"
+        h="${hk_c[$((i % lh))]}"
+        case "$c" in
+            chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
+        esac
+        add_test "OpenSSH8 X448 组合$((i+1)): kex=curve448-sha512 cipher=$c mac=${m:-NONE} hostkey=$h" \
+            "curve448-sha512" "$c" "$m" "$h" "OpenSSH8/X448" 2
+    done
 }
 
 # ============================================================
 # openEuler 国密算法测试
 # ============================================================
 load_openeuler_tests() {
-    add_test "sm4-ctr (国密加密)" \
-        "curve25519-sha256" "sm4-ctr" "hmac-sm3" "ssh-sm2" "Cipher/国密" 2
-    add_test "hmac-sm3 (国密MAC)" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sm3" "ssh-sm2" "MAC/国密" 2
-    add_test "ssh-sm2 (国密主机密钥)" \
-        "curve25519-sha256" "aes256-ctr" "hmac-sm3" "ssh-sm2" "HostKey/国密" 2
+    # 国密测试策略（与 load_dynamic_tests 相同的方案 A）：
+    #   ① 全链路保底：SM2 + SM4 + SM3 + 国密 KEX 完整四要素组合必测。
+    #   ② 对 WORKER_* 各维度用 server_algo_supported 逐个 -T 预过滤，
+    #      构建"国密有效候选集"。
+    #   ③ 以国密算法为锚点（sm2-sm3 / sm4-ctr / hmac-sm3 / ssh-sm2），
+    #      按 round-robin 同步推进生成四元组，全覆盖、不重复、数量=最长维。
+    add_test "国密全链路: sm2-sm3 + sm4-ctr + hmac-sm3 + ssh-sm2" \
+        "sm2-sm3" "sm4-ctr" "hmac-sm3" "ssh-sm2" "国密/全链路" 2
+
+    local kex_c=() ciph_c=() mac_c=() hk_c=()
+    local algo
+
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported kex "$algo"; then kex_c+=("$algo"); fi
+    done <<< "$WORKER_KEX"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported cipher "$algo"; then ciph_c+=("$algo"); fi
+    done <<< "$WORKER_CIPHERS"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported mac "$algo"; then mac_c+=("$algo"); fi
+    done <<< "$WORKER_MACS"
+    while IFS= read -r algo; do
+        [[ -n "$algo" ]] || continue
+        if server_algo_supported hostkey "$algo"; then hk_c+=("$algo"); fi
+    done <<< "$WORKER_HOSTKEYS"
+
+    local lk=${#kex_c[@]} lc=${#ciph_c[@]} lm=${#mac_c[@]} lh=${#hk_c[@]}
+    local n=$((lk > lc ? lk : (lc > lm ? lc : (lm > lh ? lm : lh))))
+    (( n > 0 )) || return 0
+
+    local i k c m h
+    for ((i=0; i<n; i++)); do
+        k="${kex_c[$((i % lk))]}"
+        c="${ciph_c[$((i % lc))]}"
+        m="${mac_c[$((i % lm))]}"
+        h="${hk_c[$((i % lh))]}"
+        case "$c" in
+            chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) m="" ;;
+        esac
+        # 锚点：确保国密元素（sm4-ctr / hmac-sm3 / ssh-sm2 / sm2-sm3）在轮转中
+        # 至少挂到一组合上；add_test 会再经 server_candidate_supported 过滤。
+        add_test "国密组合$((i+1)): kex=$k cipher=$c mac=${m:-NONE} hostkey=$h" \
+            "$k" "$c" "$m" "$h" "国密/轮转" 2
+    done
 }
 
 if ! detect_env; then
@@ -962,7 +987,13 @@ case "$PROFILE" in
         ;;
     centos6)
         load_centos6_tests
-        load_ssh1_tests
+        # SSH-1 双重判定：当前有效配置 protocol 含 1（主）且 sshd 二进制仍支持
+        # SSH-1（附加）时才生成 SSH-1 测试项；否则只测 SSH-2。
+        if sshd_effective_protocol_has_1 && ssh1_binary_supported; then
+            load_ssh1_tests
+        else
+            log "跳过 SSH-1 测试：当前 sshd 有效配置不含 Protocol 1，或该二进制不支持 SSH-1；仅测 SSH-2。"
+        fi
         ;;
     openssh8)
         load_dynamic_tests
@@ -1648,17 +1679,23 @@ wait_for_manual_client() {
     fi
     log "等待外部客户端连接（最多 ${max_wait} 秒；客户端发起连接后自动继续，无需手动 Enter）"
     while (( waited < max_wait )); do
-        local d
+        local d cur_size
         d="$(read_log_delta "$file" "$size")"
         if [[ -n "$d" ]]; then
-            # 信号可能分布在多次增量里，故对累积的 acc 判断，避免漏判。
-            acc+="$d"
-            if printf '%s\n' "$acc" | grep -qiE \
+            # 只对本次新增的日志片段判断；把 size 推进到文件当前大小，
+            # 避免下一轮重复读同一段而无限累积同内容，或旧连接反复命中。
+            if printf '%s\n' "$d" | grep -qiE \
                 'Connection from|kex: |server->client|Accepted password|Accepted publickey|PAM: authentication'; then
+                acc+="$d"
                 log "已检测到外部客户端连接日志，自动进入下一项。"
                 printf '%s' "$acc"
                 return 0
             fi
+            acc+="$d"
+        fi
+        cur_size="$(stat -c %s "$file" 2>/dev/null || echo "$size")"
+        if [[ "$file" != JOURNAL:* && "$cur_size" != "$size" ]]; then
+            size="$cur_size"
         fi
         sleep 2
         waited=$((waited + 2))
